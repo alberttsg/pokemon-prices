@@ -9,6 +9,8 @@
 //   c/<pid % 256>.json   precio actual: { <pid>: { <acabado>: [mercado, mínimo, mercado hace 7 días, mercado hace 30 días] } }
 //   h/<pid % 4096>.json  histórico: { start, s: { <pid>: { <acabado>: [céntimos del día 0, del día 1, ...] } } }
 //                        un valor por día desde start (null si ese día no hubo precio)
+//   trends.json          tendencias del mercado (solo cartas sueltas): las que más suben y bajan en 7 y 30 días y las
+//                        más caras, por idioma, con su id e imagen de TCGdex (ver buildTrends)
 // Acabados con el nombre de TCGdex: normal, holofoil, reverse-holofoil, 1st-edition-holofoil...
 
 import { mkdir, readFile, writeFile, appendFile, rm } from 'node:fs/promises'
@@ -25,6 +27,16 @@ const RETRIES = 3
 const HISTORY_DAYS = 90
 const CURRENT_SHARDS = 256
 const HISTORY_SHARDS = 4096
+
+// Tendencias: cartas por lista e idioma, y precio mínimo para entrar (por debajo, un salto de 0,10 a 0,30 $
+// sería un +200 % sin importancia)
+const TRENDS_PER_LIST = 50
+const TRENDS_MIN_PRICE = 5
+const TRENDS_MIN_FROM = 2
+// Candidatas que se revisan por lista (se descartan los productos sellados al ver sus datos)
+const TRENDS_CANDIDATES = 400
+const TCGDEX_URL = 'https://api.tcgdex.net/v2'
+const LANGUAGE_BY_CATEGORY = { 3: 'en', 85: 'ja' }
 
 const DAY_MS = 24 * 3600 * 1000
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
@@ -85,6 +97,8 @@ const main = async () => {
 
   // ---- Precios de hoy: { pid: { acabado: { market, low } } }
   const today = new Map()
+  // De qué categoría y expansión es cada producto (para las tendencias)
+  const productGroup = new Map()
   const failed = []
   let groupCount = 0
 
@@ -99,9 +113,12 @@ const main = async () => {
         groupCount++
 
         for (const price of prices) {
-          const market = price.marketPrice ?? price.midPrice ?? null
-          if(!(market > 0) && !(price.lowPrice > 0)) continue
+          // Solo el precio de mercado (sale de ventas reales). El medio sale de los anuncios, y algunos son
+          // absurdos (99.999 $): sin precio de mercado, la app sigue con el de TCGdex
+          const market = price.marketPrice > 0 ? price.marketPrice : null
+          if(!market) continue
 
+          productGroup.set(price.productId, { category, groupId: group.groupId, groupName: group.name, abbreviation: group.abbreviation })
           const finishes = today.get(price.productId) || {}
           finishes[finishKey(price.subTypeName)] = { market, low: price.lowPrice ?? null }
           today.set(price.productId, finishes)
@@ -183,6 +200,15 @@ const main = async () => {
   await Promise.all(currentShards.map((data, shard) => writeFile(path.join(out, 'c', `${shard}.json`), JSON.stringify(data))))
   await Promise.all(historyShards.map((data, shard) => writeFile(path.join(out, 'h', `${shard}.json`), JSON.stringify({ start, s: data }))))
 
+  // ---- Tendencias del mercado
+  try {
+    const trends = await buildTrends({ history, today, productGroup, length })
+    await writeFile(path.join(out, 'trends.json'), JSON.stringify({ updated, days: length, ...trends }))
+  } catch (e) {
+    // Sin tendencias se publican igualmente los precios
+    console.log(`::warning::trends: ${e.message}`)
+  }
+
   // Con expansiones fallidas no se marca el día como publicado: la siguiente ejecución lo vuelve a intentar
   await writeFile(path.join(out, 'index.json'), JSON.stringify({
     updated: failed.length > 0 ? `${updated} (incompleto)` : updated,
@@ -193,6 +219,139 @@ const main = async () => {
   }))
 
   console.log(`${groupCount} expansiones · ${today.size} productos con precio hoy · ${history.size} con histórico · ${length} días desde ${start}${failed.length > 0 ? ` · ${failed.length} expansiones con fallos` : ''}`)
+}
+
+// ---- Tendencias ----
+// Variación de cada producto en `days` días (con el acabado de más valor hoy). Se compara con el precio más
+// cercano a hace `days` días dentro del histórico; con menos días de histórico, con el más antiguo
+const changesOver = (history, today, length, days) => {
+  const back = Math.min(days, length - 1)
+  if(back < 1) return []
+
+  const changes = []
+  for (const [pid, finishes] of history) {
+    let best = null
+    for (const [finish, values] of Object.entries(finishes)) {
+      const now = today.get(pid)?.[finish]?.market
+      if(!(now >= TRENDS_MIN_PRICE)) continue
+      // El primer precio conocido desde hace `back` días
+      const from = fromCents(values.slice(values.length - 1 - back).find(v => v !== null))
+      if(!(from >= TRENDS_MIN_FROM) || (best && best.price >= now)) continue
+      best = { pid, finish, price: now, from, change: (now - from) / from * 100 }
+    }
+    if(best && best.change !== 0) changes.push(best)
+  }
+  return changes
+}
+
+const tcgdexJson = async (url) => {
+  await sleep(REQUEST_PAUSE_MS)
+  const res = await fetch(`${TCGDEX_URL}${url}`)
+  if(!res.ok) return null
+  return res.json()
+}
+
+// Lista de cartas de TCGdex de la expansión de un grupo de TCGPlayer: inglés por el código impreso (OBF) y el total;
+// japonés, el código es el id de la expansión (SV5a). Se guarda por grupo
+const tcgdexSets = new Map()
+const tcgdexSetFor = async (info, total) => {
+  const key = `${info.category}-${info.groupId}`
+  if(tcgdexSets.has(key)) return tcgdexSets.get(key)
+
+  let set = null
+  try {
+    const code = (info.abbreviation || '').trim()
+    if(code && LANGUAGE_BY_CATEGORY[info.category] === 'ja'){
+      set = await tcgdexJson(`/ja/sets/${encodeURIComponent(code)}`)
+    } else if(code){
+      const sets = await tcgdexJson(`/en/sets?abbreviation.official=eq:${encodeURIComponent(code)}`) || []
+      const match = sets.find(e => e.cardCount?.official === total) || sets[0]
+      if(match) set = await tcgdexJson(`/en/sets/${encodeURIComponent(match.id)}`)
+    }
+  } catch (e) {
+    set = null
+  }
+
+  tcgdexSets.set(key, set)
+  return set
+}
+
+const buildTrends = async ({ history, today, productGroup, length }) => {
+  const week = changesOver(history, today, length, 7)
+  const month = length - 1 >= 14 ? changesOver(history, today, length, 30) : []
+
+  // Más caras hoy (no necesitan histórico)
+  const priciest = []
+  for (const [pid, finishes] of today) {
+    const [finish, data] = Object.entries(finishes).sort((a, b) => (b[1].market || 0) - (a[1].market || 0))[0] || []
+    if(data?.market >= TRENDS_MIN_PRICE) priciest.push({ pid, finish, price: data.market })
+  }
+
+  const byLanguage = (items, language) => items.filter(e => LANGUAGE_BY_CATEGORY[productGroup.get(e.pid)?.category] === language)
+  const lists = {}
+  for (const language of ['en', 'ja']) {
+    lists[`rising7_${language}`] = byLanguage(week, language).filter(e => e.change > 0).sort((a, b) => b.change - a.change).slice(0, TRENDS_CANDIDATES)
+    lists[`falling7_${language}`] = byLanguage(week, language).filter(e => e.change < 0).sort((a, b) => a.change - b.change).slice(0, TRENDS_CANDIDATES)
+    lists[`rising30_${language}`] = byLanguage(month, language).filter(e => e.change > 0).sort((a, b) => b.change - a.change).slice(0, TRENDS_CANDIDATES)
+    lists[`falling30_${language}`] = byLanguage(month, language).filter(e => e.change < 0).sort((a, b) => a.change - b.change).slice(0, TRENDS_CANDIDATES)
+    lists[`top_${language}`] = byLanguage(priciest, language).sort((a, b) => b.price - a.price).slice(0, TRENDS_CANDIDATES)
+  }
+
+  // Datos de los productos candidatos (nombre, número, rareza): solo de sus expansiones
+  const groups = new Set(Object.values(lists).flat().map(e => { const g = productGroup.get(e.pid); return `${g.category}/${g.groupId}` }))
+  const products = new Map()
+  for (const group of groups) {
+    try {
+      for (const product of await requestJson(`/tcgplayer/${group}/products`)) products.set(product.productId, product)
+    } catch (e) {
+      console.log(`::warning::products ${group}: ${e.message}`)
+    }
+  }
+
+  const describe = async (entry) => {
+    const product = products.get(entry.pid)
+    const number = product?.extendedData?.find(e => e.name === 'Number')?.value
+    // Sin número: sobres, cajas y demás productos sellados
+    if(!product || !number) return null
+
+    const info = productGroup.get(entry.pid)
+    const [localId, total] = number.split('/')
+    const set = await tcgdexSetFor(info, Number(total))
+    const card = set?.cards?.find(e => String(e.localId).replace(/^0+/, '') === String(localId).replace(/^0+/, ''))
+
+    // Solo cartas que están en TCGdex: así se pueden abrir en la app (con su ficha e imagen)
+    if(!card) return null
+
+    return {
+      pid: entry.pid,
+      finish: entry.finish,
+      lang: LANGUAGE_BY_CATEGORY[info.category],
+      // "Charizard ex - 125/197", "Pikachu - 227/S-P" -> el nombre, sin el número
+      name: product.name.replace(/\s+-\s+[A-Za-z]*\d[\w\/-]*$/, '').trim(),
+      number,
+      set: info.groupName.replace(/^[A-Za-z0-9.]+:\s*/, ''),
+      code: info.abbreviation || null,
+      rarity: product.extendedData.find(e => e.name === 'Rarity')?.value || null,
+      price: entry.price,
+      from: entry.from ?? null,
+      change: entry.change !== undefined ? Math.round(entry.change * 10) / 10 : null,
+      tcgdexId: card.id,
+      image: card.image || null,
+    }
+  }
+
+  const result = {}
+  for (const [name, candidates] of Object.entries(lists)) {
+    const items = []
+    for (const entry of candidates) {
+      if(items.length >= TRENDS_PER_LIST) break
+      const item = await describe(entry)
+      if(item) items.push(item)
+    }
+    result[name] = items
+  }
+
+  return { lists: result }
 }
 
 main().catch(e => {
